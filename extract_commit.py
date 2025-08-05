@@ -112,6 +112,145 @@ def calculate_commit_duration(commit_section):
         return None
 
 
+IGNORED_LOG_PATTERNS = [
+    re.compile(r'making txn commit explicit'),
+    re.compile(r'looking up descriptors for ids'),
+    # Add more patterns here as needed
+]
+
+
+def analyze_commit_timing(commit_section):
+    """
+    Analyze the timing patterns in the COMMIT section to identify the longest step, ignoring certain log lines.
+    
+    Args:
+        commit_section (list): List of lines containing the COMMIT section
+        
+    Returns:
+        dict: Analysis results with timing information and category
+    """
+    try:
+        if not commit_section:
+            return None
+        
+        # Parse all timing information from the commit section
+        timing_events = []
+        
+        for line in commit_section:
+            # Look for timestamp pattern like "267.242ms    214.906ms"
+            match = re.search(r'^\s*(\d+\.\d+)ms\s+(\d+\.\d+)ms', line)
+            if match:
+                total_time = float(match.group(1))
+                step_time = float(match.group(2))
+                # Check if this line should be ignored
+                ignore = any(p.search(line) for p in IGNORED_LOG_PATTERNS)
+                timing_events.append({
+                    'total_time': total_time,
+                    'step_time': step_time,
+                    'line': line.strip(),
+                    'ignore': ignore
+                })
+        
+        if not timing_events:
+            return None
+        
+        # Find the step with the longest duration, ignoring excluded lines
+        filtered_events = [e for e in timing_events if not e['ignore']]
+        if filtered_events:
+            longest_step = max(filtered_events, key=lambda x: x['step_time'])
+        else:
+            # If all are ignored, fallback to the original list
+            longest_step = max(timing_events, key=lambda x: x['step_time'])
+        
+        # Check if this is a QueryIntent step
+        is_query_intent = False
+        if 'received pre-commit QueryIntent batch response' in longest_step['line']:
+            is_query_intent = True
+        
+        return {
+            'longest_step_time': longest_step['step_time'],
+            'longest_step_line': longest_step['line'],
+            'is_query_intent': is_query_intent,
+            'all_timing_events': timing_events
+        }
+        
+    except Exception as e:
+        print(f"Error analyzing commit timing: {e}")
+        return None
+
+
+def analyze_network_timing(commit_section, network_threshold):
+    """
+    Analyze network timing patterns in the COMMIT section.
+    
+    Args:
+        commit_section (list): List of lines containing the COMMIT section
+        network_threshold (float): Threshold in milliseconds for network operations
+        
+    Returns:
+        dict: Network analysis results with timing information and node info
+    """
+    try:
+        if not commit_section:
+            return None
+        
+        # Look for client-server batch operation patterns
+        client_operations = []
+        server_operations = []
+        
+        for line in commit_section:
+            # Look for client operations
+            if ('=== operation:/cockroach.roachpb.Internal/Batch' in line and 
+                'span.kind:‹client›' in line):
+                # Extract timestamp and node info
+                match = re.search(r'^\s*(\d+\.\d+)ms', line)
+                if match:
+                    timestamp = float(match.group(1))
+                    # Extract node number
+                    node_match = re.search(r'node:‹(\d+)›', line)
+                    node = node_match.group(1) if node_match else None
+                    client_operations.append({
+                        'timestamp': timestamp,
+                        'node': node,
+                        'line': line.strip()
+                    })
+            
+            # Look for server operations
+            elif ('=== operation:/cockroach.roachpb.Internal/Batch' in line and 
+                  'span.kind:‹server›' in line):
+                # Extract timestamp and duration
+                match = re.search(r'^\s*(\d+\.\d+)ms\s+(\d+\.\d+)ms', line)
+                if match:
+                    timestamp = float(match.group(1))
+                    duration = float(match.group(2))
+                    # Extract node number
+                    node_match = re.search(r'node:‹(\d+)›', line)
+                    node = node_match.group(1) if node_match else None
+                    server_operations.append({
+                        'timestamp': timestamp,
+                        'duration': duration,
+                        'node': node,
+                        'line': line.strip()
+                    })
+        
+        # Find the longest network operation
+        longest_network = None
+        for server_op in server_operations:
+            if server_op['duration'] > network_threshold:
+                if longest_network is None or server_op['duration'] > longest_network['duration']:
+                    longest_network = server_op
+        
+        return {
+            'longest_network': longest_network,
+            'client_operations': client_operations,
+            'server_operations': server_operations
+        }
+        
+    except Exception as e:
+        print(f"Error analyzing network timing: {e}")
+        return None
+
+
 def main():
     """Main function to process all trace files."""
     
@@ -119,9 +258,12 @@ def main():
     parser = argparse.ArgumentParser(description='Extract COMMIT portions from trace files')
     parser.add_argument('--min-duration', type=float, default=50.0,
                        help='Minimum COMMIT duration in milliseconds (default: 50ms)')
+    parser.add_argument('--network-threshold', type=float, default=50.0,
+                       help='Network threshold in milliseconds for categorizing network operations (default: 50ms)')
     args = parser.parse_args()
     
     min_duration = args.min_duration
+    network_threshold = args.network_threshold
     
     # Create output directory
     output_dir = Path("extracted_commits")
@@ -163,17 +305,34 @@ def main():
             filtered_count += 1
             continue
         
+        # Analyze timing patterns
+        timing_analysis = analyze_commit_timing(commit_section)
+        
         # Store valid commit for sorting
         valid_commits.append({
             'trace_file': trace_file,
             'trace_number': trace_number,
             'first_line': first_line,
             'commit_section': commit_section,
-            'commit_duration': commit_duration
+            'commit_duration': commit_duration,
+            'timing_analysis': timing_analysis
         })
     
     # Sort commits by duration (slowest first)
     valid_commits.sort(key=lambda x: x['commit_duration'] or 0, reverse=True)
+    
+    # Create subdirectories
+    query_intent_dir = output_dir / "query_intent"
+    network_dir = output_dir / "network"
+    other_dir = output_dir / "other"
+    query_intent_dir.mkdir(exist_ok=True)
+    network_dir.mkdir(exist_ok=True)
+    other_dir.mkdir(exist_ok=True)
+    
+    # Track counts for each category
+    query_intent_count = 0
+    network_count = 0
+    other_count = 0
     
     # Write sorted commits with monotonically increasing prefix
     for index, commit_data in enumerate(valid_commits, 1):
@@ -181,10 +340,38 @@ def main():
         first_line = commit_data['first_line']
         commit_section = commit_data['commit_section']
         commit_duration = commit_data['commit_duration']
+        timing_analysis = commit_data['timing_analysis']
+        
+        # Determine category based on timing analysis
+        category = "other"
+        if timing_analysis and timing_analysis['is_query_intent']:
+            category = "query_intent"
+            query_intent_count += 1
+        else:
+            # Check for network operations
+            network_analysis = analyze_network_timing(commit_section, network_threshold)
+            if network_analysis and network_analysis['longest_network']:
+                category = "network"
+                network_count += 1
+            else:
+                other_count += 1
+        
+        # Choose output directory based on category
+        if category == "query_intent":
+            target_dir = query_intent_dir
+        elif category == "network":
+            # Create node-specific subdirectory
+            network_analysis = analyze_network_timing(commit_section, network_threshold)
+            node_number = network_analysis['longest_network']['node']
+            node_dir = network_dir / str(node_number)
+            node_dir.mkdir(exist_ok=True)
+            target_dir = node_dir
+        else:
+            target_dir = other_dir
         
         # Create output filename with prefix
         output_filename = f"{index}_extracted_commit_{trace_number}.txt"
-        output_path = output_dir / output_filename
+        output_path = target_dir / output_filename
         
         # Write the extracted commit with first line prepended
         try:
@@ -195,6 +382,21 @@ def main():
                 else:
                     f.write("COMMIT duration: Could not calculate\n")
                 f.write('\n')  # Add a blank line for separation
+                
+                # Write timing analysis info
+                if timing_analysis:
+                    f.write(f"Longest step: {timing_analysis['longest_step_time']:.3f} ms\n")
+                    f.write(f"Category: {category}\n")
+                    f.write(f"Longest step details: {timing_analysis['longest_step_line']}\n")
+                    
+                    # Add network information if applicable
+                    if category == "network":
+                        network_analysis = analyze_network_timing(commit_section, network_threshold)
+                        if network_analysis and network_analysis['longest_network']:
+                            network_op = network_analysis['longest_network']
+                            f.write(f"Network operation: {network_op['duration']:.3f} ms on node {network_op['node']}\n")
+                    
+                    f.write('\n')  # Add a blank line for separation
                 
                 # Write the first line (transaction duration info)
                 f.write(first_line + '\n')
@@ -211,9 +413,16 @@ def main():
     
     print(f"\nProcessing complete!")
     print(f"Successfully processed: {processed_count} files")
+    print(f"  - QueryIntent category: {query_intent_count} files")
+    print(f"  - Network category: {network_count} files")
+    print(f"  - Other category: {other_count} files")
     print(f"Skipped: {skipped_count} files")
     print(f"Filtered out (duration < {min_duration}ms): {filtered_count} files")
+    print(f"Network threshold: {network_threshold}ms")
     print(f"Output directory: {output_dir.absolute()}")
+    print(f"  - QueryIntent files: {query_intent_dir.absolute()}")
+    print(f"  - Network files: {network_dir.absolute()}")
+    print(f"  - Other files: {other_dir.absolute()}")
 
 
 if __name__ == "__main__":
