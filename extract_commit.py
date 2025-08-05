@@ -258,11 +258,14 @@ def main():
     parser = argparse.ArgumentParser(description='Extract COMMIT portions from trace files')
     parser.add_argument('--min-duration', type=float, default=50.0,
                        help='Minimum COMMIT duration in milliseconds (default: 50ms)')
+    parser.add_argument('--max-duration', type=float, default=150.0,
+                       help='Maximum COMMIT duration in milliseconds (default: 150ms)')
     parser.add_argument('--network-threshold', type=float, default=50.0,
                        help='Network threshold in milliseconds for categorizing network operations (default: 50ms)')
     args = parser.parse_args()
     
     min_duration = args.min_duration
+    max_duration = args.max_duration
     network_threshold = args.network_threshold
     
     # Create output directory
@@ -274,7 +277,7 @@ def main():
     trace_files.sort()  # Sort to ensure consistent ordering
     
     print(f"Found {len(trace_files)} trace files to process...")
-    print(f"Minimum COMMIT duration filter: {min_duration}ms")
+    print(f"COMMIT duration filter: {min_duration}ms - {max_duration}ms")
     
     processed_count = 0
     skipped_count = 0
@@ -300,10 +303,14 @@ def main():
             skipped_count += 1
             continue
         
-        # Check if commit duration meets the minimum threshold
-        if commit_duration is not None and commit_duration < min_duration:
-            filtered_count += 1
-            continue
+        # Check if commit duration meets the minimum and maximum thresholds
+        if commit_duration is not None:
+            if commit_duration < min_duration:
+                filtered_count += 1
+                continue
+            if commit_duration > max_duration:
+                filtered_count += 1
+                continue
         
         # Analyze timing patterns
         timing_analysis = analyze_commit_timing(commit_section)
@@ -417,7 +424,7 @@ def main():
     print(f"  - Network category: {network_count} files")
     print(f"  - Other category: {other_count} files")
     print(f"Skipped: {skipped_count} files")
-    print(f"Filtered out (duration < {min_duration}ms): {filtered_count} files")
+    print(f"Filtered out (duration < {min_duration}ms or > {max_duration}ms): {filtered_count} files")
     print(f"Network threshold: {network_threshold}ms")
     print(f"Output directory: {output_dir.absolute()}")
     print(f"  - QueryIntent files: {query_intent_dir.absolute()}")
