@@ -179,13 +179,14 @@ def analyze_commit_timing(commit_section):
         return None
 
 
-def analyze_network_timing(commit_section, network_threshold):
+def analyze_network_timing(commit_section, network_threshold, abnormal_threshold=5.0):
     """
     Analyze network timing patterns in the COMMIT section.
     
     Args:
         commit_section (list): List of lines containing the COMMIT section
         network_threshold (float): Threshold in milliseconds for network operations
+        abnormal_threshold (float): Threshold in milliseconds for abnormal network patterns
         
     Returns:
         dict: Network analysis results with timing information and node info
@@ -194,30 +195,137 @@ def analyze_network_timing(commit_section, network_threshold):
         if not commit_section:
             return None
         
-        # Look for client-server batch operation patterns
-        client_operations = []
-        server_operations = []
+        client_server_pairs = []
+        server_client_pairs = []
+        
+        # Find all client->server pairs
+        for i, line in enumerate(commit_section):
+            # Look for client operation
+            client_match = re.search(r'(\d+\.\d+)ms\s+(\d+\.\d+)ms\s+=== operation:/cockroach\.roachpb\.Internal/Batch _verbose:‹1› node:‹(\d+)›.*span\.kind:‹client›', line)
+            if client_match:
+                client_timestamp = float(client_match.group(1))
+                client_duration = float(client_match.group(2))
+                client_node = int(client_match.group(3))
+                
+                # Look for corresponding server operation
+                for j in range(i + 1, len(commit_section)):
+                    server_line = commit_section[j]
+                    server_match = re.search(r'(\d+\.\d+)ms\s+(\d+\.\d+)ms\s+=== operation:/cockroach\.roachpb\.Internal/Batch _verbose:‹1› node:‹(\d+)› span\.kind:‹server›', server_line)
+                    if server_match:
+                        server_timestamp = float(server_match.group(1))
+                        server_duration = float(server_match.group(2))
+                        server_node = int(server_match.group(3))
+                        
+                        # Calculate client->server latency (server timestamp - client timestamp)
+                        client_server_latency = server_timestamp - client_timestamp
+                        
+                        client_server_pairs.append({
+                            'client_timestamp': client_timestamp,
+                            'server_timestamp': server_timestamp,
+                            'client_node': client_node,
+                            'server_node': server_node,
+                            'latency': client_server_latency,
+                            'client_line': line.strip(),
+                            'server_line': server_line.strip()
+                        })
+                        break
+        
+        # Find all server->client pairs
+        for i, line in enumerate(commit_section):
+            # Look for "node sending response"
+            server_response_match = re.search(r'(\d+\.\d+)ms\s+(\d+\.\d+)ms\s+event:server/node\.go:1472 \[n(\d+)\] node sending response', line)
+            if server_response_match:
+                server_response_timestamp = float(server_response_match.group(1))
+                server_response_duration = float(server_response_match.group(2))
+                server_node = int(server_response_match.group(3))
+                
+                # Look for corresponding "received batch response"
+                for j in range(i + 1, len(commit_section)):
+                    client_line = commit_section[j]
+                    client_received_match = re.search(r'(\d+\.\d+)ms\s+(\d+\.\d+)ms\s+event:kv/kvclient/kvcoord/transport\.go:207 \[n(\d+),client=.*?\] ‹received batch response›', client_line)
+                    if client_received_match:
+                        client_received_timestamp = float(client_received_match.group(1))
+                        client_received_duration = float(client_received_match.group(2))
+                        client_node = int(client_received_match.group(3))
+                        
+                        # Calculate server->client latency (client received - server response)
+                        server_client_latency = client_received_timestamp - server_response_timestamp
+                        
+                        server_client_pairs.append({
+                            'server_response_timestamp': server_response_timestamp,
+                            'client_received_timestamp': client_received_timestamp,
+                            'server_node': server_node,
+                            'client_node': client_node,
+                            'latency': server_client_latency,
+                            'server_line': line.strip(),
+                            'client_line': client_line.strip()
+                        })
+                        break
+        
+        # Find the longest client->server latency
+        longest_client_server = None
+        for pair in client_server_pairs:
+            if longest_client_server is None or pair['latency'] > longest_client_server['latency']:
+                longest_client_server = pair
+        
+        # Find the longest server->client latency
+        longest_server_client = None
+        for pair in server_client_pairs:
+            if longest_server_client is None or pair['latency'] > longest_server_client['latency']:
+                longest_server_client = pair
+        
+        # Check for abnormal patterns (significant discrepancy between client->server and server->client)
+        abnormal_network = None
+        if longest_client_server and longest_server_client:
+            # Check if they correspond to the same round trip (same client and server nodes)
+            if (longest_client_server['client_node'] == longest_server_client['client_node'] and 
+                longest_client_server['server_node'] == longest_server_client['server_node']):
+                discrepancy = abs(longest_client_server['latency'] - longest_server_client['latency'])
+                if discrepancy > abnormal_threshold:
+                    abnormal_network = {
+                        'client_server_latency': longest_client_server['latency'],
+                        'server_client_latency': longest_server_client['latency'],
+                        'discrepancy': discrepancy,
+                        'server_node': longest_client_server['server_node'],
+                        'client_node': longest_client_server['client_node'],
+                        'client_server_pair': longest_client_server,
+                        'server_client_pair': longest_server_client
+                    }
+        
+        return {
+            'longest_client_server': longest_client_server,
+            'longest_server_client': longest_server_client,
+            'abnormal_network': abnormal_network,
+            'client_server_pairs': client_server_pairs,
+            'server_client_pairs': server_client_pairs
+        }
+        
+    except Exception as e:
+        print(f"Error analyzing network timing: {e}")
+        return None
+
+
+def analyze_raft_timing(commit_section, raft_threshold):
+    """
+    Analyze Raft timing patterns in the COMMIT section.
+    
+    Args:
+        commit_section (list): List of lines containing the COMMIT section
+        raft_threshold (float): Threshold in milliseconds for Raft operations
+        
+    Returns:
+        dict: Raft analysis results with timing information and node info
+    """
+    try:
+        if not commit_section:
+            return None
+        
+        # Look for local proposal operations
+        raft_operations = []
         
         for line in commit_section:
-            # Look for client operations
-            if ('=== operation:/cockroach.roachpb.Internal/Batch' in line and 
-                'span.kind:‹client›' in line):
-                # Extract timestamp and node info
-                match = re.search(r'^\s*(\d+\.\d+)ms', line)
-                if match:
-                    timestamp = float(match.group(1))
-                    # Extract node number
-                    node_match = re.search(r'node:‹(\d+)›', line)
-                    node = node_match.group(1) if node_match else None
-                    client_operations.append({
-                        'timestamp': timestamp,
-                        'node': node,
-                        'line': line.strip()
-                    })
-            
-            # Look for server operations
-            elif ('=== operation:/cockroach.roachpb.Internal/Batch' in line and 
-                  'span.kind:‹server›' in line):
+            # Look for local proposal operations
+            if '=== operation:local proposal _verbose' in line:
                 # Extract timestamp and duration
                 match = re.search(r'^\s*(\d+\.\d+)ms\s+(\d+\.\d+)ms', line)
                 if match:
@@ -226,28 +334,27 @@ def analyze_network_timing(commit_section, network_threshold):
                     # Extract node number
                     node_match = re.search(r'node:‹(\d+)›', line)
                     node = node_match.group(1) if node_match else None
-                    server_operations.append({
+                    raft_operations.append({
                         'timestamp': timestamp,
                         'duration': duration,
                         'node': node,
                         'line': line.strip()
                     })
         
-        # Find the longest network operation
-        longest_network = None
-        for server_op in server_operations:
-            if server_op['duration'] > network_threshold:
-                if longest_network is None or server_op['duration'] > longest_network['duration']:
-                    longest_network = server_op
+        # Find the longest Raft operation
+        longest_raft = None
+        for raft_op in raft_operations:
+            if raft_op['duration'] > raft_threshold:
+                if longest_raft is None or raft_op['duration'] > longest_raft['duration']:
+                    longest_raft = raft_op
         
         return {
-            'longest_network': longest_network,
-            'client_operations': client_operations,
-            'server_operations': server_operations
+            'longest_raft': longest_raft,
+            'raft_operations': raft_operations
         }
         
     except Exception as e:
-        print(f"Error analyzing network timing: {e}")
+        print(f"Error analyzing Raft timing: {e}")
         return None
 
 
@@ -262,11 +369,14 @@ def main():
                        help='Maximum COMMIT duration in milliseconds (default: 150ms)')
     parser.add_argument('--network-threshold', type=float, default=50.0,
                        help='Network threshold in milliseconds for categorizing network operations (default: 50ms)')
+    parser.add_argument('--raft-threshold', type=float, default=50.0,
+                       help='Raft threshold in milliseconds for categorizing Raft operations (default: 50ms)')
     args = parser.parse_args()
     
     min_duration = args.min_duration
     max_duration = args.max_duration
     network_threshold = args.network_threshold
+    raft_threshold = args.raft_threshold
     
     # Create output directory
     output_dir = Path("extracted_commits")
@@ -331,14 +441,17 @@ def main():
     # Create subdirectories
     query_intent_dir = output_dir / "query_intent"
     network_dir = output_dir / "network"
+    raft_dir = output_dir / "raft"
     other_dir = output_dir / "other"
     query_intent_dir.mkdir(exist_ok=True)
     network_dir.mkdir(exist_ok=True)
+    raft_dir.mkdir(exist_ok=True)
     other_dir.mkdir(exist_ok=True)
     
     # Track counts for each category
     query_intent_count = 0
     network_count = 0
+    raft_count = 0
     other_count = 0
     
     # Write sorted commits with monotonically increasing prefix
@@ -357,20 +470,61 @@ def main():
         else:
             # Check for network operations
             network_analysis = analyze_network_timing(commit_section, network_threshold)
-            if network_analysis and network_analysis['longest_network']:
+            if network_analysis and network_analysis['longest_client_server'] and network_analysis['longest_client_server']['latency'] > network_threshold:
                 category = "network"
                 network_count += 1
+            elif network_analysis and network_analysis['longest_server_client'] and network_analysis['longest_server_client']['latency'] > network_threshold:
+                category = "network_server_client"
+                network_count += 1
             else:
-                other_count += 1
+                # Check for abnormal network patterns
+                if network_analysis and network_analysis['abnormal_network']:
+                    category = "network_abnormal"
+                    network_count += 1
+                else:
+                    # Check for Raft operations
+                    raft_analysis = analyze_raft_timing(commit_section, raft_threshold)
+                    if raft_analysis and raft_analysis['longest_raft']:
+                        category = "raft"
+                        raft_count += 1
+                    else:
+                        other_count += 1
         
         # Choose output directory based on category
         if category == "query_intent":
             target_dir = query_intent_dir
         elif category == "network":
-            # Create node-specific subdirectory
+            # Create node-specific subdirectory under client_server
             network_analysis = analyze_network_timing(commit_section, network_threshold)
-            node_number = network_analysis['longest_network']['node']
-            node_dir = network_dir / str(node_number)
+            node_number = network_analysis['longest_client_server']['server_node']
+            client_server_dir = network_dir / "client_server"
+            client_server_dir.mkdir(exist_ok=True)
+            node_dir = client_server_dir / str(node_number)
+            node_dir.mkdir(exist_ok=True)
+            target_dir = node_dir
+        elif category == "network_server_client":
+            # Create node-specific subdirectory under server_client
+            network_analysis = analyze_network_timing(commit_section, network_threshold)
+            node_number = network_analysis['longest_server_client']['server_node']
+            server_client_dir = network_dir / "server_client"
+            server_client_dir.mkdir(exist_ok=True)
+            node_dir = server_client_dir / str(node_number)
+            node_dir.mkdir(exist_ok=True)
+            target_dir = node_dir
+        elif category == "network_abnormal":
+            # Create node-specific subdirectory under abnormal
+            network_analysis = analyze_network_timing(commit_section, network_threshold)
+            node_number = network_analysis['abnormal_network']['server_node']
+            abnormal_dir = network_dir / "abnormal"
+            abnormal_dir.mkdir(exist_ok=True)
+            node_dir = abnormal_dir / str(node_number)
+            node_dir.mkdir(exist_ok=True)
+            target_dir = node_dir
+        elif category == "raft":
+            # Create node-specific subdirectory
+            raft_analysis = analyze_raft_timing(commit_section, raft_threshold)
+            node_number = raft_analysis['longest_raft']['node']
+            node_dir = raft_dir / str(node_number)
             node_dir.mkdir(exist_ok=True)
             target_dir = node_dir
         else:
@@ -399,9 +553,40 @@ def main():
                     # Add network information if applicable
                     if category == "network":
                         network_analysis = analyze_network_timing(commit_section, network_threshold)
-                        if network_analysis and network_analysis['longest_network']:
-                            network_op = network_analysis['longest_network']
-                            f.write(f"Network operation: {network_op['duration']:.3f} ms on node {network_op['node']}\n")
+                        if network_analysis and network_analysis['longest_client_server']:
+                            network_op = network_analysis['longest_client_server']
+                            f.write(f"Client->server latency: {network_op['latency']:.3f} ms\n")
+                            f.write(f"  Client node: {network_op['client_node']}\n")
+                            f.write(f"  Server node: {network_op['server_node']}\n")
+                    
+                    # Add server-client round trip information if applicable
+                    if category == "network_server_client":
+                        network_analysis = analyze_network_timing(commit_section, network_threshold)
+                        if network_analysis and network_analysis['longest_server_client']:
+                            round_trip_op = network_analysis['longest_server_client']
+                            f.write(f"Server->client latency: {round_trip_op['latency']:.3f} ms\n")
+                            f.write(f"  Server node: {round_trip_op['server_node']}\n")
+                            f.write(f"  Client node: {round_trip_op['client_node']}\n")
+                            f.write(f"  Server response: {round_trip_op['server_response_timestamp']:.3f} ms\n")
+                            f.write(f"  Client received: {round_trip_op['client_received_timestamp']:.3f} ms\n")
+                    
+                    # Add abnormal network information if applicable
+                    if category == "network_abnormal":
+                        network_analysis = analyze_network_timing(commit_section, network_threshold)
+                        if network_analysis and network_analysis['abnormal_network']:
+                            abnormal_op = network_analysis['abnormal_network']
+                            f.write(f"Abnormal network pattern: {abnormal_op['discrepancy']:.3f} ms discrepancy\n")
+                            f.write(f"  Server node: {abnormal_op['server_node']}\n")
+                            f.write(f"  Client node: {abnormal_op['client_node']}\n")
+                            f.write(f"  Client->server latency: {abnormal_op['client_server_latency']:.3f} ms\n")
+                            f.write(f"  Server->client latency: {abnormal_op['server_client_latency']:.3f} ms\n")
+                    
+                    # Add Raft information if applicable
+                    if category == "raft":
+                        raft_analysis = analyze_raft_timing(commit_section, raft_threshold)
+                        if raft_analysis and raft_analysis['longest_raft']:
+                            raft_op = raft_analysis['longest_raft']
+                            f.write(f"Raft operation: {raft_op['duration']:.3f} ms on node {raft_op['node']}\n")
                     
                     f.write('\n')  # Add a blank line for separation
                 
@@ -422,13 +607,16 @@ def main():
     print(f"Successfully processed: {processed_count} files")
     print(f"  - QueryIntent category: {query_intent_count} files")
     print(f"  - Network category: {network_count} files")
+    print(f"  - Raft category: {raft_count} files")
     print(f"  - Other category: {other_count} files")
     print(f"Skipped: {skipped_count} files")
     print(f"Filtered out (duration < {min_duration}ms or > {max_duration}ms): {filtered_count} files")
     print(f"Network threshold: {network_threshold}ms")
+    print(f"Raft threshold: {raft_threshold}ms")
     print(f"Output directory: {output_dir.absolute()}")
     print(f"  - QueryIntent files: {query_intent_dir.absolute()}")
     print(f"  - Network files: {network_dir.absolute()}")
+    print(f"  - Raft files: {raft_dir.absolute()}")
     print(f"  - Other files: {other_dir.absolute()}")
 
 
