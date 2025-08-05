@@ -1,5 +1,6 @@
 # Ignore traces directory
 traces/
+extracted_commits/
 
 # Python
 __pycache__/
