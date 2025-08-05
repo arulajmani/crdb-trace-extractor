@@ -138,6 +138,9 @@ def main():
     skipped_count = 0
     filtered_count = 0
     
+    # Collect all valid commits with their durations for sorting
+    valid_commits = []
+    
     for trace_file in trace_files:
         # Extract trace number from filename
         match = re.search(r'trace_(\d+)\.txt', trace_file)
@@ -160,8 +163,27 @@ def main():
             filtered_count += 1
             continue
         
-        # Create output filename
-        output_filename = f"extracted_commit_{trace_number}.txt"
+        # Store valid commit for sorting
+        valid_commits.append({
+            'trace_file': trace_file,
+            'trace_number': trace_number,
+            'first_line': first_line,
+            'commit_section': commit_section,
+            'commit_duration': commit_duration
+        })
+    
+    # Sort commits by duration (slowest first)
+    valid_commits.sort(key=lambda x: x['commit_duration'] or 0, reverse=True)
+    
+    # Write sorted commits with monotonically increasing prefix
+    for index, commit_data in enumerate(valid_commits, 1):
+        trace_number = commit_data['trace_number']
+        first_line = commit_data['first_line']
+        commit_section = commit_data['commit_section']
+        commit_duration = commit_data['commit_duration']
+        
+        # Create output filename with prefix
+        output_filename = f"{index}_extracted_commit_{trace_number}.txt"
         output_path = output_dir / output_filename
         
         # Write the extracted commit with first line prepended
