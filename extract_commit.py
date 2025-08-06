@@ -115,6 +115,7 @@ def calculate_commit_duration(commit_section):
 IGNORED_LOG_PATTERNS = [
     re.compile(r'making txn commit explicit'),
     re.compile(r'looking up descriptors for ids'),
+    re.compile(r'event:kv/kvclient/kvcoord/transport\.go:207.*‹received batch response›'),
     # Add more patterns here as needed
 ]
 
@@ -320,12 +321,48 @@ def analyze_raft_timing(commit_section, raft_threshold):
         if not commit_section:
             return None
         
-        # Look for local proposal operations
+        # Look for Raft-related operations
         raft_operations = []
         
         for line in commit_section:
+            # Look for "submitting proposal to proposal buffer"
+            if 'event:kv/kvserver/replica_raft.go:430' in line and 'submitting proposal to proposal buffer' in line:
+                # Extract timestamp and duration
+                match = re.search(r'^\s*(\d+\.\d+)ms\s+(\d+\.\d+)ms', line)
+                if match:
+                    timestamp = float(match.group(1))
+                    duration = float(match.group(2))
+                    # Extract node number
+                    node_match = re.search(r'\[n(\d+)', line)
+                    node = node_match.group(1) if node_match else None
+                    raft_operations.append({
+                        'type': 'submitting_proposal',
+                        'timestamp': timestamp,
+                        'duration': duration,
+                        'node': node,
+                        'line': line.strip()
+                    })
+            
+            # Look for "flushing proposal to Raft"
+            elif 'event:kv/kvserver/replica_proposal_buf.go:612' in line and 'flushing proposal to Raft' in line:
+                # Extract timestamp and duration
+                match = re.search(r'^\s*(\d+\.\d+)ms\s+(\d+\.\d+)ms', line)
+                if match:
+                    timestamp = float(match.group(1))
+                    duration = float(match.group(2))
+                    # Extract node number
+                    node_match = re.search(r'\[n(\d+)', line)
+                    node = node_match.group(1) if node_match else None
+                    raft_operations.append({
+                        'type': 'flushing_proposal',
+                        'timestamp': timestamp,
+                        'duration': duration,
+                        'node': node,
+                        'line': line.strip()
+                    })
+            
             # Look for local proposal operations
-            if '=== operation:local proposal _verbose' in line:
+            elif '=== operation:local proposal _verbose' in line:
                 # Extract timestamp and duration
                 match = re.search(r'^\s*(\d+\.\d+)ms\s+(\d+\.\d+)ms', line)
                 if match:
@@ -335,26 +372,183 @@ def analyze_raft_timing(commit_section, raft_threshold):
                     node_match = re.search(r'node:‹(\d+)›', line)
                     node = node_match.group(1) if node_match else None
                     raft_operations.append({
+                        'type': 'local_proposal',
+                        'timestamp': timestamp,
+                        'duration': duration,
+                        'node': node,
+                        'line': line.strip()
+                    })
+            
+            # Look for "applying command"
+            elif 'event:kv/kvserver/app_batch.go:116' in line and 'applying command' in line:
+                # Extract timestamp and duration
+                match = re.search(r'^\s*(\d+\.\d+)ms\s+(\d+\.\d+)ms', line)
+                if match:
+                    timestamp = float(match.group(1))
+                    duration = float(match.group(2))
+                    # Extract node number
+                    node_match = re.search(r'\[n(\d+)', line)
+                    node = node_match.group(1) if node_match else None
+                    raft_operations.append({
+                        'type': 'applying_command',
+                        'timestamp': timestamp,
+                        'duration': duration,
+                        'node': node,
+                        'line': line.strip()
+                    })
+            
+            # Look for "LocalResult"
+            elif 'event:kv/kvserver/replica_application_state_machine.go:185' in line and 'LocalResult' in line:
+                # Extract timestamp and duration
+                match = re.search(r'^\s*(\d+\.\d+)ms\s+(\d+\.\d+)ms', line)
+                if match:
+                    timestamp = float(match.group(1))
+                    duration = float(match.group(2))
+                    # Extract node number
+                    node_match = re.search(r'\[n(\d+)', line)
+                    node = node_match.group(1) if node_match else None
+                    raft_operations.append({
+                        'type': 'local_result',
                         'timestamp': timestamp,
                         'duration': duration,
                         'node': node,
                         'line': line.strip()
                     })
         
-        # Find the longest Raft operation
-        longest_raft = None
+        # Group Raft operations by node and calculate cumulative duration
+        raft_by_node = {}
         for raft_op in raft_operations:
-            if raft_op['duration'] > raft_threshold:
-                if longest_raft is None or raft_op['duration'] > longest_raft['duration']:
-                    longest_raft = raft_op
+            node = raft_op['node']
+            if node not in raft_by_node:
+                raft_by_node[node] = {
+                    'node': node,
+                    'operations': [],
+                    'total_duration': 0.0
+                }
+            raft_by_node[node]['operations'].append(raft_op)
+            raft_by_node[node]['total_duration'] += raft_op['duration']
+        
+        # Find the node with the highest cumulative Raft duration
+        longest_raft = None
+        for node_data in raft_by_node.values():
+            if node_data['total_duration'] > raft_threshold:
+                if longest_raft is None or node_data['total_duration'] > longest_raft['total_duration']:
+                    longest_raft = node_data
         
         return {
             'longest_raft': longest_raft,
-            'raft_operations': raft_operations
+            'raft_operations': raft_operations,
+            'raft_by_node': raft_by_node
         }
         
     except Exception as e:
         print(f"Error analyzing Raft timing: {e}")
+        return None
+
+
+def analyze_store_send_timing(commit_section, store_send_threshold):
+    """
+    Analyze store_send timing patterns in the COMMIT section.
+    
+    Args:
+        commit_section (list): List of lines containing the COMMIT section
+        store_send_threshold (float): Threshold in milliseconds for store_send operations
+        
+    Returns:
+        dict: Store_send analysis results with timing information and node info
+    """
+    try:
+        if not commit_section:
+            return None
+        
+        # Look for store_send operations
+        store_send_operations = []
+        
+        for line in commit_section:
+            # Look for store_send operations
+            if 'event:kv/kvserver/store_send.go:149' in line and 'executing' in line:
+                # Extract timestamp and duration
+                match = re.search(r'^\s*(\d+\.\d+)ms\s+(\d+\.\d+)ms', line)
+                if match:
+                    timestamp = float(match.group(1))
+                    duration = float(match.group(2))
+                    # Extract node number
+                    node_match = re.search(r'\[n(\d+)', line)
+                    node = node_match.group(1) if node_match else None
+                    store_send_operations.append({
+                        'timestamp': timestamp,
+                        'duration': duration,
+                        'node': node,
+                        'line': line.strip()
+                    })
+        
+        # Find the longest store_send operation
+        longest_store_send = None
+        for store_send_op in store_send_operations:
+            if store_send_op['duration'] > store_send_threshold:
+                if longest_store_send is None or store_send_op['duration'] > longest_store_send['duration']:
+                    longest_store_send = store_send_op
+        
+        return {
+            'longest_store_send': longest_store_send,
+            'store_send_operations': store_send_operations
+        }
+        
+    except Exception as e:
+        print(f"Error analyzing store_send timing: {e}")
+        return None
+
+
+def analyze_replica_send_timing(commit_section, replica_send_threshold):
+    """
+    Analyze replica_send timing patterns in the COMMIT section.
+    
+    Args:
+        commit_section (list): List of lines containing the COMMIT section
+        replica_send_threshold (float): Threshold in milliseconds for replica_send operations
+        
+    Returns:
+        dict: Replica_send analysis results with timing information and node info
+    """
+    try:
+        if not commit_section:
+            return None
+        
+        # Look for replica_send operations
+        replica_send_operations = []
+        
+        for line in commit_section:
+            # Look for replica_send operations
+            if 'event:kv/kvserver/replica_send.go:182' in line and 'read-write path' in line:
+                # Extract timestamp and duration
+                match = re.search(r'^\s*(\d+\.\d+)ms\s+(\d+\.\d+)ms', line)
+                if match:
+                    timestamp = float(match.group(1))
+                    duration = float(match.group(2))
+                    # Extract node number
+                    node_match = re.search(r'\[n(\d+)', line)
+                    node = node_match.group(1) if node_match else None
+                    replica_send_operations.append({
+                        'timestamp': timestamp,
+                        'duration': duration,
+                        'node': node,
+                        'line': line.strip()
+                    })
+        
+        # Find the longest replica_send operation
+        longest_replica_send = None
+        for replica_send_op in replica_send_operations:
+            if replica_send_op['duration'] > replica_send_threshold:
+                if longest_replica_send is None or replica_send_op['duration'] > longest_replica_send['duration']:
+                    longest_replica_send = replica_send_op
+        
+        return {
+            'longest_replica_send': longest_replica_send,
+            'replica_send_operations': replica_send_operations
+        }
+        
+    except Exception as e:
+        print(f"Error analyzing replica_send timing: {e}")
         return None
 
 
@@ -369,14 +563,20 @@ def main():
                        help='Maximum COMMIT duration in milliseconds (default: 150ms)')
     parser.add_argument('--network-threshold', type=float, default=50.0,
                        help='Network threshold in milliseconds for categorizing network operations (default: 50ms)')
-    parser.add_argument('--raft-threshold', type=float, default=50.0,
-                       help='Raft threshold in milliseconds for categorizing Raft operations (default: 50ms)')
+    parser.add_argument('--raft-threshold', type=float, default=40.0,
+                       help='Raft threshold in milliseconds for categorizing Raft operations (default: 40ms)')
+    parser.add_argument('--store-send-threshold', type=float, default=10.0,
+                       help='Store_send threshold in milliseconds for categorizing store_send operations (default: 10ms)')
+    parser.add_argument('--replica-send-threshold', type=float, default=10.0,
+                       help='Replica_send threshold in milliseconds for categorizing replica_send operations (default: 10ms)')
     args = parser.parse_args()
     
     min_duration = args.min_duration
     max_duration = args.max_duration
     network_threshold = args.network_threshold
     raft_threshold = args.raft_threshold
+    store_send_threshold = args.store_send_threshold
+    replica_send_threshold = args.replica_send_threshold
     
     # Create output directory
     output_dir = Path("extracted_commits")
@@ -442,16 +642,22 @@ def main():
     query_intent_dir = output_dir / "query_intent"
     network_dir = output_dir / "network"
     raft_dir = output_dir / "raft"
+    store_send_dir = output_dir / "store_send"
+    replica_send_dir = output_dir / "replica_send"
     other_dir = output_dir / "other"
     query_intent_dir.mkdir(exist_ok=True)
     network_dir.mkdir(exist_ok=True)
     raft_dir.mkdir(exist_ok=True)
+    store_send_dir.mkdir(exist_ok=True)
+    replica_send_dir.mkdir(exist_ok=True)
     other_dir.mkdir(exist_ok=True)
     
     # Track counts for each category
     query_intent_count = 0
     network_count = 0
     raft_count = 0
+    store_send_count = 0
+    replica_send_count = 0
     other_count = 0
     
     # Write sorted commits with monotonically increasing prefix
@@ -488,7 +694,19 @@ def main():
                         category = "raft"
                         raft_count += 1
                     else:
-                        other_count += 1
+                        # Check for store_send operations
+                        store_send_analysis = analyze_store_send_timing(commit_section, store_send_threshold)
+                        if store_send_analysis and store_send_analysis['longest_store_send']:
+                            category = "store_send"
+                            store_send_count += 1
+                        else:
+                            # Check for replica_send operations
+                            replica_send_analysis = analyze_replica_send_timing(commit_section, replica_send_threshold)
+                            if replica_send_analysis and replica_send_analysis['longest_replica_send']:
+                                category = "replica_send"
+                                replica_send_count += 1
+                            else:
+                                other_count += 1
         
         # Choose output directory based on category
         if category == "query_intent":
@@ -525,6 +743,20 @@ def main():
             raft_analysis = analyze_raft_timing(commit_section, raft_threshold)
             node_number = raft_analysis['longest_raft']['node']
             node_dir = raft_dir / str(node_number)
+            node_dir.mkdir(exist_ok=True)
+            target_dir = node_dir
+        elif category == "store_send":
+            # Create node-specific subdirectory
+            store_send_analysis = analyze_store_send_timing(commit_section, store_send_threshold)
+            node_number = store_send_analysis['longest_store_send']['node']
+            node_dir = store_send_dir / str(node_number)
+            node_dir.mkdir(exist_ok=True)
+            target_dir = node_dir
+        elif category == "replica_send":
+            # Create node-specific subdirectory
+            replica_send_analysis = analyze_replica_send_timing(commit_section, replica_send_threshold)
+            node_number = replica_send_analysis['longest_replica_send']['node']
+            node_dir = replica_send_dir / str(node_number)
             node_dir.mkdir(exist_ok=True)
             target_dir = node_dir
         else:
@@ -586,7 +818,23 @@ def main():
                         raft_analysis = analyze_raft_timing(commit_section, raft_threshold)
                         if raft_analysis and raft_analysis['longest_raft']:
                             raft_op = raft_analysis['longest_raft']
-                            f.write(f"Raft operation: {raft_op['duration']:.3f} ms on node {raft_op['node']}\n")
+                            f.write(f"Raft operations: {raft_op['total_duration']:.3f} ms total on node {raft_op['node']}\n")
+                            for op in raft_op['operations']:
+                                f.write(f"  {op['type']}: {op['duration']:.3f} ms\n")
+                    
+                    # Add store_send information if applicable
+                    if category == "store_send":
+                        store_send_analysis = analyze_store_send_timing(commit_section, store_send_threshold)
+                        if store_send_analysis and store_send_analysis['longest_store_send']:
+                            store_send_op = store_send_analysis['longest_store_send']
+                            f.write(f"Store_send operation: {store_send_op['duration']:.3f} ms on node {store_send_op['node']}\n")
+                    
+                    # Add replica_send information if applicable
+                    if category == "replica_send":
+                        replica_send_analysis = analyze_replica_send_timing(commit_section, replica_send_threshold)
+                        if replica_send_analysis and replica_send_analysis['longest_replica_send']:
+                            replica_send_op = replica_send_analysis['longest_replica_send']
+                            f.write(f"Replica_send operation: {replica_send_op['duration']:.3f} ms on node {replica_send_op['node']}\n")
                     
                     f.write('\n')  # Add a blank line for separation
                 
@@ -608,11 +856,15 @@ def main():
     print(f"  - QueryIntent category: {query_intent_count} files")
     print(f"  - Network category: {network_count} files")
     print(f"  - Raft category: {raft_count} files")
+    print(f"  - Store_send category: {store_send_count} files")
+    print(f"  - Replica_send category: {replica_send_count} files")
     print(f"  - Other category: {other_count} files")
     print(f"Skipped: {skipped_count} files")
     print(f"Filtered out (duration < {min_duration}ms or > {max_duration}ms): {filtered_count} files")
     print(f"Network threshold: {network_threshold}ms")
     print(f"Raft threshold: {raft_threshold}ms")
+    print(f"Store_send threshold: {store_send_threshold}ms")
+    print(f"Replica_send threshold: {replica_send_threshold}ms")
     print(f"Output directory: {output_dir.absolute()}")
     print(f"  - QueryIntent files: {query_intent_dir.absolute()}")
     print(f"  - Network files: {network_dir.absolute()}")
