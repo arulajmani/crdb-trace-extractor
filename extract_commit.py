@@ -557,6 +557,8 @@ def main():
     
     # Parse command line arguments
     parser = argparse.ArgumentParser(description='Extract COMMIT portions from trace files')
+    parser.add_argument('--debug-zip', '-d', default="~/Downloads/debug 4", 
+                       help='Path to debug zip directory (default: ~/Downloads/debug 4)')
     parser.add_argument('--min-duration', type=float, default=50.0,
                        help='Minimum COMMIT duration in milliseconds (default: 50ms)')
     parser.add_argument('--max-duration', type=float, default=150.0,
@@ -578,13 +580,34 @@ def main():
     store_send_threshold = args.store_send_threshold
     replica_send_threshold = args.replica_send_threshold
     
-    # Create output directory
-    output_dir = Path("extracted_commits")
-    output_dir.mkdir(exist_ok=True)
+    # Expand user path if needed
+    debug_zip_path = os.path.expanduser(args.debug_zip)
+    
+    if not os.path.exists(debug_zip_path):
+        print(f"Error: Debug zip directory '{debug_zip_path}' does not exist")
+        exit(1)
+    
+    # Extract debug zip name from path
+    debug_zip_name = os.path.basename(debug_zip_path)
+    
+    # Check if the corresponding traces directory exists
+    traces_dir = Path("bin") / debug_zip_name / "traces"
+    if not traces_dir.exists():
+        print(f"Error: Traces directory '{traces_dir}' does not exist")
+        print(f"Please run analyze_debug_zip.py first to extract traces from '{debug_zip_path}'")
+        exit(1)
     
     # Get all trace files
-    trace_files = glob.glob("traces/trace_*.txt")
+    trace_files = list(traces_dir.glob("trace_*.txt"))
     trace_files.sort()  # Sort to ensure consistent ordering
+    
+    if not trace_files:
+        print(f"No trace files found in {traces_dir} directory")
+        return
+    
+    # Create output directory in the same directory as traces
+    output_dir = traces_dir.parent / "extracted_commits"
+    output_dir.mkdir(exist_ok=True)
     
     print(f"Found {len(trace_files)} trace files to process...")
     print(f"COMMIT duration filter: {min_duration}ms - {max_duration}ms")
@@ -598,7 +621,7 @@ def main():
     
     for trace_file in trace_files:
         # Extract trace number from filename
-        match = re.search(r'trace_(\d+)\.txt', trace_file)
+        match = re.search(r'trace_(\d+)\.txt', trace_file.name)
         if not match:
             print(f"Could not extract number from filename: {trace_file}")
             continue
@@ -606,7 +629,7 @@ def main():
         trace_number = match.group(1)
         
         # Extract commit portion
-        first_line, commit_section, commit_duration = extract_commit_from_trace(trace_file)
+        first_line, commit_section, commit_duration = extract_commit_from_trace(str(trace_file))
         
         if first_line is None or commit_section is None:
             print(f"No COMMIT section found in {trace_file}")
@@ -627,7 +650,7 @@ def main():
         
         # Store valid commit for sorting
         valid_commits.append({
-            'trace_file': trace_file,
+            'trace_file': str(trace_file),
             'trace_number': trace_number,
             'first_line': first_line,
             'commit_section': commit_section,
@@ -853,12 +876,30 @@ def main():
     
     print(f"\nProcessing complete!")
     print(f"Successfully processed: {processed_count} files")
-    print(f"  - QueryIntent category: {query_intent_count} files")
-    print(f"  - Network category: {network_count} files")
-    print(f"  - Raft category: {raft_count} files")
-    print(f"  - Store_send category: {store_send_count} files")
-    print(f"  - Replica_send category: {replica_send_count} files")
-    print(f"  - Other category: {other_count} files")
+    
+    # Calculate percentages
+    if processed_count > 0:
+        query_intent_pct = (query_intent_count / processed_count) * 100
+        network_pct = (network_count / processed_count) * 100
+        raft_pct = (raft_count / processed_count) * 100
+        store_send_pct = (store_send_count / processed_count) * 100
+        replica_send_pct = (replica_send_count / processed_count) * 100
+        other_pct = (other_count / processed_count) * 100
+        
+        print(f"  - QueryIntent category: {query_intent_count} files ({query_intent_pct:.1f}%)")
+        print(f"  - Network category: {network_count} files ({network_pct:.1f}%)")
+        print(f"  - Raft category: {raft_count} files ({raft_pct:.1f}%)")
+        print(f"  - Store_send category: {store_send_count} files ({store_send_pct:.1f}%)")
+        print(f"  - Replica_send category: {replica_send_count} files ({replica_send_pct:.1f}%)")
+        print(f"  - Other category: {other_count} files ({other_pct:.1f}%)")
+    else:
+        print(f"  - QueryIntent category: {query_intent_count} files")
+        print(f"  - Network category: {network_count} files")
+        print(f"  - Raft category: {raft_count} files")
+        print(f"  - Store_send category: {store_send_count} files")
+        print(f"  - Replica_send category: {replica_send_count} files")
+        print(f"  - Other category: {other_count} files")
+    
     print(f"Skipped: {skipped_count} files")
     print(f"Filtered out (duration < {min_duration}ms or > {max_duration}ms): {filtered_count} files")
     print(f"Network threshold: {network_threshold}ms")

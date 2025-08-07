@@ -212,8 +212,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Extract slow SQL transaction traces from debug zip files")
     parser.add_argument("--debug-zip", "-d", default="~/Downloads/debug 4", 
                        help="Path to debug zip directory (default: ~/Downloads/debug 4)")
-    parser.add_argument("--output", "-o", default="traces", 
-                       help="Output directory for traces (default: traces)")
+    parser.add_argument("--output", "-o", default=None, 
+                       help="Output directory for traces (default: bin/<debug_zip_name>/traces)")
     parser.add_argument("--threshold", "-t", type=float, default=200.0,
                        help="Minimum threshold in milliseconds for traces to include (default: 200.0)")
     parser.add_argument("--filter", "-f", default="portal resolved to.*COMMIT",
@@ -228,7 +228,18 @@ if __name__ == "__main__":
         print(f"Error: Debug zip directory '{debug_zip_path}' does not exist")
         exit(1)
     
-    num_traces = extract_slow_traces_from_debug_zip(debug_zip_path, args.output, args.threshold, args.filter)
+    # Determine output directory
+    if args.output:
+        output_dir = args.output
+    else:
+        # Extract debug zip name from path
+        debug_zip_name = os.path.basename(debug_zip_path)
+        output_dir = os.path.join("bin", debug_zip_name, "traces")
+    
+    # Create the output directory structure
+    os.makedirs(output_dir, exist_ok=True)
+    
+    num_traces = extract_slow_traces_from_debug_zip(debug_zip_path, output_dir, args.threshold, args.filter)
     if num_traces == 0:
         print(f"No traces found >= {args.threshold}ms")
     else:
